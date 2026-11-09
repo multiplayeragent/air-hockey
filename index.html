@@ -1,0 +1,525 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Air Hockey</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; overscroll-behavior: none; background: #070b1c; }
+  body { font: 15px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color: #eef2f8; user-select: none; -webkit-user-select: none; }
+  canvas { display: block; width: 100vw; height: 100vh; height: 100dvh; touch-action: none; cursor: none; }
+  [hidden] { display: none !important; }
+  .hud { position: fixed; pointer-events: none; text-shadow: 0 1px 4px #000c; left: 0; right: 0; text-align: center; }
+  #role { top: max(10px, env(safe-area-inset-top)); font-weight: 700; font-size: 14px; opacity: .9; }
+  #hint { top: calc(max(10px, env(safe-area-inset-top)) + 24px); font-size: 14px; opacity: .85; transition: opacity 1s; }
+  #msg { top: 50%; transform: translateY(-50%); font-size: min(16vw, 84px); font-weight: 900; letter-spacing: .04em; opacity: 0; transition: opacity .25s, transform .25s; }
+  #msg.on { opacity: 1; transform: translateY(-50%) scale(1.08); }
+  #net { bottom: max(10px, env(safe-area-inset-bottom)); font-size: 12px; opacity: .75; }
+  #over { position: fixed; inset: 0; display: grid; place-items: center; background: #070b1cb0; }
+  .card { width: min(340px, 88vw); max-height: 86vh; overflow: auto; padding: 22px; border-radius: 16px; background: #121a3a; border: 1px solid #ffffff22; text-align: center; }
+  .card h2 { margin: 0 0 4px; font-size: 26px; }
+  .card h3 { margin: 14px 0 4px; font-size: 14px; color: #ffd166; text-align: left; }
+  .card ol { text-align: left; margin: 0; padding-left: 26px; font-size: 14px; min-height: 30px; }
+  .card li span { float: right; font-variant-numeric: tabular-nums; }
+  .card p { margin: 8px 0 0; font-size: 13px; opacity: .8; }
+  button.go { width: 100%; min-height: 48px; margin-top: 14px; border: 0; border-radius: 12px; background: #3fe0c5; color: #062019; font: 800 17px system-ui, sans-serif; cursor: pointer; }
+</style>
+<script src="https://cdn.multiplayeragent.com/sdk/mp.global.js"></script>
+</head>
+<body>
+<canvas id="game"></canvas>
+<div class="hud" id="role"></div>
+<div class="hud" id="hint"></div>
+<div class="hud" id="msg"></div>
+<div class="hud" id="net">Connecting…</div>
+<div id="over" hidden><div class="card">
+  <h2 id="winner"></h2><div id="final"></div>
+  <h3>Most wins</h3><ol id="board"><li>Loading…</li></ol>
+  <button class="go" id="again">Play again</button><p id="next"></p>
+</div></div>
+<script>
+/* ═══ AIR HOCKEY · a Multiplayer Agent starter ═════════════════════════════════════════
+ * One puck, real bounces, first to 7. Versus, exactly 2 players: alone you play a bot,
+ * and a third person watches (and plays the winner next).
+ *
+ * WHERE THINGS ARE (search for the "── " headers):
+ *   CONFIG ........ goals to win, table size, puck and paddle physics, the bot
+ *   CONNECTION .... MP_CONNECT, joining, the offline room, who is host
+ *   PHYSICS ....... the puck: walls, paddles, goals (the host and everyone's prediction use it)
+ *   MATCH (HOST) .. seats, score, serves, the winner and the bot paddles. Only the host writes these.
+ *   MY PADDLE ..... following your mouse or finger; your own hits on the puck
+ *   DRAW .......... the table seen from YOUR end (flipped for the second player), puck, paddles, sparks
+ *   HUD & RESULTS . messages, results card, leaderboard
+ *   INPUT ......... mouse and touch
+ *
+ * HOW THE MULTIPLAYER WORKS (a relay room: no server code):
+ *   - Each player writes its OWN entity: `pad` {x, y} (its paddle, in table units) about
+ *     20 times a second, `hb` (heartbeat) once a second, `rdy` (Play again), `n`/`c` once.
+ *   - The HOST is the lowest sessionId among live players (heartbeat seen in the last 3s),
+ *     worked out every frame. Only the host writes the shared fields:
+ *       `game` {id, v, phase, seats, score, serveAt, win, endsAt}: who plays (a sessionId or
+ *              "bot"), the score and the match. `v` goes up on every write.
+ *       `puck` {x, y, vx, vy, h, s, z, b}: the puck ~20 times a second (h = hits so far,
+ *              s = write number, z = waiting for a serve, b = the bot paddles).
+ *   - The host moves the puck against the walls, its own paddle and the bot paddles. Everyone
+ *     else extrapolates the puck between writes and decides THEIR OWN paddle's hits: when
+ *     your paddle hits the puck on your screen, you bounce it at once and send "hit" {x, y,
+ *     vx, vy, g}; the host checks it is plausible and adopts it. A puck that crosses your goal
+ *     line on the host's screen waits `goalGrace` ms for your save before it counts.
+ *   - A new host adopts `game` and `puck` from state and carries on: same score, same puck.
+ *   - ?attract plays offline, bot against bot (the preview video is recorded from it).
+ *   - Leaderboard "wins": each win adds 1 to the winner's total.
+ */
+
+// ── CONFIG ──────────────────────────────────────────────────────────────────────────
+const CONFIG = {
+  goalsToWin: 7,
+  tableW: 600, tableL: 1000, // table size in table units; the goals are at the two short ends
+  goalW: 230,                // goal mouth width
+  puckR: 24, paddleR: 42,
+  maxPuck: 1800,             // fastest the puck can go, units/s
+  friction: 0.18,            // share of its speed the puck loses per second
+  bounce: 0.9,               // how much speed a bounce keeps
+  paddleMax: 3600,           // fastest your paddle follows your pointer, units/s
+  botSpeed: 1050,            // the bot paddle's top speed, units/s
+  botError: 34,              // how far off the bot aims, units
+  botDefend: 0.6,            // how closely the bot follows the puck across its goal (1 = perfectly)
+  servePause: 1400,          // ms the puck waits after a goal
+  resultsMs: 9000,           // ms on the results card before the next match
+  sendMs: 50,                // paddle and puck updates (~20 a second)
+  goalGrace: 220,            // ms a remote player has to save a puck that crossed its line on the host's screen
+  board: "wins",
+};
+const COLORS = ["#ff4d6d", "#3fa7ff", "#ffd23f", "#4ee08a", "#b26bff", "#ff8c42", "#ff6fd8", "#3fe0c5"];
+const BOT_NAME = "Puckbot", BOT_COLORS = ["#ffb547", "#3fe0c5"]; // a bot in seat 0 / seat 1
+
+// ── CONNECTION ──────────────────────────────────────────────────────────────────────
+// The builder fills these in for this game. Downloaded from GitHub? Put your own pk_ key here.
+const MP_CONNECT = {
+  key: 'pk_REPLACE_ME',
+  room: 'air-hockey',
+  endpoint: 'wss://live.multiplayeragent.com',
+  apiUrl: 'https://api.multiplayeragent.com',
+};
+const ATTRACT = new URLSearchParams(location.search).has("attract");
+
+/** Same shape as the SDK client, kept in this tab: offline play and ?attract. */
+function localRoom() {
+  const id = "local", state = { entities: { players: { [id]: {} } }, shared: {} }, subs = [];
+  let queued = false;
+  const emit = () => { if (!queued) { queued = true; queueMicrotask(() => { queued = false; subs.forEach((f) => f(state)); }); } };
+  const put = (o, k, v) => { if (typeof k === "object") Object.assign(o, k); else o[k] = v; emit(); };
+  return {
+    sessionId: id, state, offline: true,
+    me: { set: (k, v) => put(state.entities.players[id], k, v) },
+    setShared: (k, v) => put(state.shared, k, v),
+    onState: (f) => { subs.push(f); f(state); }, onJoin() {}, onLeave() {}, on() {}, send() {},
+    onDisconnect() {}, onReconnect() {}, leave: async () => {},
+  };
+}
+async function connect() {
+  if (ATTRACT || typeof MP === "undefined") return localRoom();
+  try {
+    const mp = await Promise.race([MP.join({ ...MP_CONNECT }), new Promise((_, no) => setTimeout(() => no(new Error("timed out")), 10000))]);
+    window.mp = mp; // the builder calls window.mp.leave() when the page closes
+    return mp;
+  } catch (e) {
+    console.warn("Playing offline:", e && e.message);
+    return localRoom();
+  }
+}
+const parse = (v, fb) => { if (typeof v !== "string") return fb; try { return JSON.parse(v); } catch { return fb; } };
+const memo = new Map();
+/** A JSON field, parsed once per change (read-only: never mutate what this returns). */
+function cached(key, raw, fb) { const m = memo.get(key); if (m && m.raw === raw) return m.v; const v = parse(raw, fb); memo.set(key, { raw, v }); return v; }
+let net = null, S = { entities: { players: {} }, shared: {} };
+const seenHb = new Map();
+function livePlayers() {
+  const now = performance.now(), out = [];
+  for (const [id, p] of Object.entries(S.entities.players || {})) {
+    const s = seenHb.get(id);
+    if (!s || s.hb !== p.hb) seenHb.set(id, { hb: p.hb, at: now });
+    if (id === net.sessionId || now - seenHb.get(id).at < 3000) out.push(id);
+  }
+  return out.sort();
+}
+const isHost = () => livePlayers()[0] === net.sessionId;
+const humans = () => livePlayers().filter((id) => !(ATTRACT && id === net.sessionId));
+
+// ── PHYSICS ─────────────────────────────────────────────────────────────────────────
+// Table units: x runs -HW..HW across, y runs -HL..HL along. Seat 0 defends the +y goal, seat 1 the -y goal.
+const HW = CONFIG.tableW / 2, HL = CONFIG.tableL / 2, GW = CONFIG.goalW / 2;
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+/** Move the puck dt seconds against the walls and `paddles` ({x, y, vx, vy}).
+ *  Returns { hit: the paddle that hit it or null, wall: true/false, goal: the seat whose goal it went in, or -1 }. */
+function stepPuck(p, dt, paddles) {
+  const out = { hit: null, wall: false, goal: -1 }, r = CONFIG.puckR, n = Math.max(1, Math.ceil((Math.hypot(p.vx, p.vy) * dt) / 10));
+  for (let i = 0; i < n; i++) {
+    p.x += (p.vx * dt) / n; p.y += (p.vy * dt) / n;
+    for (const q of paddles) {
+      const dx = p.x - q.x, dy = p.y - q.y, d = Math.hypot(dx, dy), min = r + CONFIG.paddleR;
+      if (d >= min || d < 0.001) continue;
+      const nx = dx / d, ny = dy / d, rel = (p.vx - q.vx) * nx + (p.vy - q.vy) * ny;
+      p.x = q.x + nx * min; p.y = q.y + ny * min;
+      if (rel < 0) { p.vx -= (1 + CONFIG.bounce) * rel * nx; p.vy -= (1 + CONFIG.bounce) * rel * ny; out.hit = q; }
+    }
+    if (Math.abs(p.x) > HW - r) { p.x = Math.sign(p.x) * (HW - r); p.vx = -p.vx * CONFIG.bounce; out.wall = true; }
+    const inMouth = Math.abs(p.x) < GW - r * 0.5;
+    if (!inMouth && Math.abs(p.y) > HL - r) { p.y = Math.sign(p.y) * (HL - r); p.vy = -p.vy * CONFIG.bounce; out.wall = true; }
+    if (Math.abs(p.y) > HL + r) { p.y = Math.sign(p.y) * (HL + r); p.vx = p.vy = 0; out.goal = p.y > 0 ? 0 : 1; break; }
+  }
+  const sp = Math.hypot(p.vx, p.vy), k = sp > CONFIG.maxPuck ? CONFIG.maxPuck / sp : 1, f = Math.max(0, 1 - CONFIG.friction * dt) * k;
+  p.vx *= f; p.vy *= f;
+  return out;
+}
+/** Move a paddle toward (tx, ty) at up to `speed`, kept inside its own half. Sets its velocity for bounces. */
+function movePaddle(q, tx, ty, speed, seat, dt) {
+  const r = CONFIG.paddleR;
+  tx = clamp(tx, -HW + r, HW - r); ty = seat === 0 ? clamp(ty, r, HL - r) : clamp(ty, -HL + r, -r);
+  const dx = tx - q.x, dy = ty - q.y, d = Math.hypot(dx, dy), step = Math.min(d, speed * dt);
+  const nx = d ? q.x + (dx / d) * step : q.x, ny = d ? q.y + (dy / d) * step : q.y;
+  q.vx = (nx - q.x) / Math.max(dt, 1e-3); q.vy = (ny - q.y) / Math.max(dt, 1e-3); q.x = nx; q.y = ny;
+}
+const homeOf = (seat) => ({ x: 0, y: seat === 0 ? HL - 110 : -HL + 110 });
+
+// ── MATCH (HOST) ────────────────────────────────────────────────────────────────────
+const host = { last: null, wasHost: false, bots: [null, null], lastPuck: 0, pending: null, gameId: 0 };
+let puck = { x: 0, y: 0, vx: 0, vy: 0, h: 0, s: 0, z: 1 }; // the host's real puck; everyone else's prediction of it
+/** The game as state has it, or the host's own newer write that hasn't come back yet. `v` only goes up. */
+function game() {
+  const g = parse(S.shared.game, null);
+  return host.last && isHost() && (!g || host.last.v > g.v) ? host.last : g;
+}
+function writeGame(g) { g = { ...g, v: (game()?.v ?? 0) + 1 }; host.last = g; net.setShared("game", JSON.stringify(g)); return g; }
+function newGame(id, seats) {
+  const side = Math.random() < 0.5 ? 0 : 1;
+  servePuck(side);
+  return { id, phase: "play", seats, score: [0, 0], serveAt: Date.now() + CONFIG.servePause + 600, win: -1, endsAt: 0 };
+}
+/** Put the puck, still, in the middle of `seat`'s half: that player serves. */
+function servePuck(seat) { Object.assign(puck, { x: 0, y: seat === 0 ? 160 : -160, vx: 0, vy: 0, z: 1 }); host.pending = null; writePuck(); }
+function writePuck(onlyIfMoved) {
+  const r = Math.round, b = host.bots.map((q) => (q ? [r(q.x), r(q.y)] : 0)), body = { x: r(puck.x), y: r(puck.y), vx: r(puck.vx), vy: r(puck.vy), h: puck.h, z: puck.z, b };
+  host.lastPuck = performance.now();
+  if (onlyIfMoved && JSON.stringify(body) === host.lastBody) return; // nothing moved: save the message
+  host.lastBody = JSON.stringify(body); puck.s++;
+  net.setShared("puck", JSON.stringify({ ...body, s: puck.s }));
+}
+/** Become host: take over the game and the puck exactly as state has them. */
+function adopt() {
+  host.wasHost = true; host.pending = null;
+  const p = parse(S.shared.puck, null);
+  if (p) { Object.assign(puck, p); host.bots = (p.b || [0, 0]).map((q) => (q ? { x: q[0], y: q[1], vx: 0, vy: 0, err: 0, thinkAt: 0 } : null)); }
+  host.gameId = game()?.id ?? 0;
+}
+/** Seats: someone who left is replaced by a bot (the match goes on); a waiting player replaces a bot (a new match). */
+function checkSeats(g) {
+  const people = humans(), seats = g.seats.map((id) => (id === "bot" || people.includes(id) ? id : "bot"));
+  let fresh = false;
+  for (let i = 0; i < 2; i++) if (seats[i] === "bot") { const next = people.find((id) => !seats.includes(id)); if (next) { seats[i] = next; fresh = true; } }
+  if (fresh && g.phase === "play") return writeGame(newGame(g.id + 1, seats));
+  return seats.join() !== g.seats.join() ? writeGame({ ...g, seats }) : g;
+}
+function hostTick(dt, now) {
+  if (!host.wasHost) adopt();
+  let g = game();
+  if (!g) { const people = humans(); g = writeGame(newGame(1, [people[0] || "bot", people[1] || "bot"])); }
+  g = checkSeats(g);
+  const t = Date.now();
+  if (g.phase === "over") {
+    const seated = g.seats.filter((id) => id !== "bot"), ready = seated.length && seated.every((id) => (id === net.sessionId ? myReady : (S.entities.players[id] || {}).rdy) === g.id);
+    if (t > g.endsAt || ready) { // next match: the winner stays on; someone waiting replaces the loser
+      const seats = [...g.seats], waiting = humans().find((id) => !seats.includes(id));
+      if (waiting && g.win >= 0) seats[1 - g.win] = waiting;
+      g = writeGame(newGame(g.id + 1, seats));
+    }
+  }
+  for (let i = 0; i < 2; i++) { // bot paddles exist only for bot seats
+    if (g.seats[i] === "bot" && !host.bots[i]) host.bots[i] = { ...homeOf(i), vx: 0, vy: 0, err: 0, thinkAt: 0 };
+    if (g.seats[i] !== "bot") host.bots[i] = null;
+    if (host.bots[i]) botMove(host.bots[i], i, dt, now, g);
+  }
+  if (g.phase === "play" && t >= g.serveAt) {
+    puck.z = 0;
+    const paddles = host.bots.filter(Boolean), mine = g.seats.indexOf(net.sessionId);
+    if (mine >= 0) paddles.push(pad);
+    const res = host.pending ? { hit: null, wall: false, goal: -1 } : stepPuck(puck, dt, paddles);
+    if (res.hit) { puck.h++; hitFx(res.hit === pad ? mine : host.bots.indexOf(res.hit)); writePuck(); }
+    if (res.wall) wallFx();
+    if (res.goal >= 0) { // in a goal: count it now, or give a remote defender a moment to send its save
+      const defender = g.seats[res.goal], remote = defender !== "bot" && defender !== net.sessionId;
+      host.pending = { side: res.goal, at: now + (remote ? CONFIG.goalGrace : 0) };
+    }
+    if (host.pending && now >= host.pending.at) {
+      const scorer = 1 - host.pending.side, score = [...g.score]; score[scorer]++;
+      const won = score[scorer] >= CONFIG.goalsToWin;
+      g = writeGame({ ...g, score, serveAt: t + CONFIG.servePause, phase: won ? "over" : "play", win: won ? scorer : -1, endsAt: won ? t + CONFIG.resultsMs : 0 });
+      servePuck(host.pending.side);
+    }
+  }
+  if (now - host.lastPuck > CONFIG.sendMs) writePuck(true);
+}
+/** The bot: blocks fast shots in front of its goal; a slow puck in its half it gets behind and drives at the other end. */
+function botMove(b, seat, dt, now, g) {
+  const dir = seat === 0 ? 1 : -1, home = homeOf(seat), mine = puck.y * dir > 0 && puck.vy * dir < 350; // in my half, and not a fast shot at me
+  if (now > b.thinkAt) { b.thinkAt = now + 120; b.err = (Math.random() - 0.5) * 2 * CONFIG.botError; }
+  if (!mine || b.aimX === undefined) b.aimX = (Math.random() - 0.5) * 1.6 * GW; // where in the far goal it will shoot
+  let tx = puck.x * CONFIG.botDefend + b.err, ty = home.y; // defend: shadow the puck across the goal
+  if (mine && g.phase === "play" && !puck.z) {
+    const behind = (b.y - puck.y) * dir > CONFIG.paddleR * 0.5;
+    const ax = b.aimX + b.err - puck.x, ay = -dir * HL - puck.y, al = Math.hypot(ax, ay);
+    if (behind) { tx = puck.x + (ax / al) * 40; ty = puck.y + (ay / al) * 40; } // drive through it toward the aim point
+    else { tx = puck.x + (b.x > puck.x ? 1 : -1) * 80; ty = puck.y + dir * 90; } // go round to get behind it
+  }
+  movePaddle(b, tx, ty, CONFIG.botSpeed, seat, dt);
+}
+
+// ── MY PADDLE ───────────────────────────────────────────────────────────────────────
+let myName = "";
+try { myName = localStorage.getItem("mpa-name") || ""; } catch {}
+myName = myName || ["Swift", "Lucky", "Ice", "Slick", "Turbo", "Cool"][Math.floor(Math.random() * 6)] + " " + ["Puck", "Slapper", "Glider", "Striker", "Blade"][Math.floor(Math.random() * 5)];
+let myColor = COLORS[0], myReady = 0; // the color is picked on join: the first one nobody in the room has
+const pad = { x: 0, y: HL - 110, vx: 0, vy: 0, tx: 0, ty: HL - 110, seat: -1, lastSend: 0, lastJson: "", lastHit: 0 };
+const pred = { lastS: -1, mineAt: 0, offX: 0, offY: 0 }; // a non-host's puck prediction
+
+function myTick(dt, g, now) {
+  const seat = g.seats.indexOf(net.sessionId);
+  if (seat !== pad.seat) { pad.seat = seat; if (seat >= 0) { Object.assign(pad, homeOf(seat)); pad.tx = pad.x; pad.ty = pad.y; } }
+  if (seat >= 0) {
+    movePaddle(pad, pad.tx, pad.ty, CONFIG.paddleMax, seat, dt);
+    const json = JSON.stringify({ x: Math.round(pad.x), y: Math.round(pad.y) });
+    if (now - pad.lastSend > CONFIG.sendMs && json !== pad.lastJson) { pad.lastSend = now; pad.lastJson = json; net.me.set("pad", json); }
+  }
+  if (isHost()) return;
+  // Not the host: our puck runs on its own between writes. A write replaces it only when something new happened
+  // there (more hits than we know of, a serve), or when we drifted far off. A write is always a little old, so one
+  // with the same hit count would drag the puck back in time (and through our own paddle).
+  const s = cached("puck", S.shared.puck, null);
+  if (s && s.s !== pred.lastS) {
+    pred.lastS = s.s;
+    const off = Math.hypot(puck.x - s.x, puck.y - s.y), drift = 80 + Math.hypot(s.vx, s.vy) * 0.3; // a fast puck is further off just from the delay
+    if (s.h > puck.h || s.z !== puck.z || (s.h === puck.h && off > drift) || (s.h < puck.h && now - pred.mineAt > 500)) { // (fewer hits: our own hit isn't in yet; give it 0.5s)
+      pred.offX += puck.x - s.x; pred.offY += puck.y - s.y; // draw the jump smoothly
+      if (s.h > puck.h) hitFx(-1);
+      Object.assign(puck, s);
+    }
+  }
+  if (puck.z || g.phase !== "play") return;
+  const others = viewPaddles(g).filter((q) => q.seat !== seat);
+  const res = stepPuck(puck, dt, seat >= 0 ? [pad, ...others] : others);
+  if (res.wall) wallFx();
+  if (res.hit === pad && now - pad.lastHit > 50) { // my paddle hit it on my screen: that's the hit
+    pad.lastHit = now; puck.h++; pred.mineAt = now; hitFx(seat);
+    const r = Math.round;
+    net.send("hit", { x: r(puck.x), y: r(puck.y), vx: r(puck.vx), vy: r(puck.vy), g: g.id });
+  }
+}
+/** A "hit" from a seated player: adopt its bounce if it happened near where the host has the puck. */
+function applyHit(msg, from) {
+  const g = game();
+  if (!g || g.phase !== "play" || msg.g !== g.id || Date.now() < g.serveAt) return;
+  const seat = g.seats.indexOf(from), x = +msg.x, y = +msg.y;
+  if (seat < 0 || !isFinite(x + y) || Math.hypot(x - puck.x, y - puck.y) > 280 || (seat === 0 ? y < -60 : y > 60)) return;
+  const v = Math.hypot(+msg.vx, +msg.vy) || 1, k = Math.min(1, CONFIG.maxPuck / v);
+  Object.assign(puck, { x, y, vx: +msg.vx * k, vy: +msg.vy * k, z: 0 }); puck.h++;
+  if (host.pending && host.pending.side === seat) host.pending = null; // saved on the line
+  hitFx(seat); writePuck();
+}
+
+// ── DRAW ────────────────────────────────────────────────────────────────────────────
+const cv = document.getElementById("game"), ctx = cv.getContext("2d");
+let W = 0, H = 0, DPR = 1, scale = 1, wide = false, M = [1, 0, 0, 1], shake = 0;
+function fit() {
+  DPR = Math.min(2, devicePixelRatio || 1); W = innerWidth; H = innerHeight; cv.width = W * DPR; cv.height = H * DPR; wide = W > H * 1.15;
+  scale = wide ? Math.min((W - 40) / (CONFIG.tableL + 60), (H - 90) / (CONFIG.tableW + 60)) : Math.min((H - 70) / (CONFIG.tableL + 60), (W - 20) / (CONFIG.tableW + 60));
+}
+addEventListener("resize", fit); addEventListener("orientationchange", fit); fit();
+/** The view from your end: your goal at the bottom (tall screens) or on the left (wide screens). M maps table to screen. */
+function setView(seat) { const f = seat === 1 ? -1 : 1; M = wide ? [0, -f, f, 0] : [f, 0, 0, f]; }
+const toScreen = (x, y) => [W / 2 + (M[0] * x + M[1] * y) * scale, H / 2 + (M[2] * x + M[3] * y) * scale];
+const toTable = (sx, sy) => { const u = (sx - W / 2) / scale, v = (sy - H / 2) / scale; return [M[0] * u + M[2] * v, M[1] * u + M[3] * v]; };
+const views = new Map(); // id -> drawn remote paddle {x, y}
+/** Every paddle to draw: { seat, x, y, vx, vy, color, name, mine }. */
+function viewPaddles(g) {
+  const bots = isHost() ? host.bots : (cached("puck", S.shared.puck, null) || {}).b || [], out = [];
+  g.seats.forEach((id, seat) => {
+    const other = g.seats[1 - seat], otherColor = other === net.sessionId ? myColor : (S.entities.players[other] || {}).c;
+    if (id === "bot") { const b = bots[seat]; if (b) out.push({ seat, x: b.x ?? b[0], y: b.y ?? b[1], vx: 0, vy: 0, color: [BOT_COLORS[seat], ...BOT_COLORS, ...COLORS].find((c) => c !== otherColor), name: BOT_NAME }); }
+    else if (id === net.sessionId) out.push({ seat, x: pad.x, y: pad.y, vx: pad.vx, vy: pad.vy, color: myColor, name: "You", mine: true });
+    else { const v = views.get(id), p = S.entities.players[id] || {}; if (v) out.push({ seat, x: v.x, y: v.y, vx: 0, vy: 0, color: p.c || "#ccc", name: String(p.n || "Player") }); }
+  });
+  return out;
+}
+const parts = [], trail = [];
+function sparks(x, y, color, n, speed) { for (let i = 0; i < n; i++) { const a = Math.random() * Math.PI * 2, s = speed * (0.3 + Math.random()); parts.push({ x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s, life: 0.4 + Math.random() * 0.4, color }); } }
+let lastFx = 0;
+function hitFx(seat) { const now = performance.now(); if (now - lastFx < 60) return; lastFx = now; sparks(puck.x, puck.y, "#e8f6ff", 12, 380); sfx("hit", Math.min(1, Math.hypot(puck.vx, puck.vy) / CONFIG.maxPuck)); }
+function wallFx() { sfx("wall", Math.min(1, Math.hypot(puck.vx, puck.vy) / CONFIG.maxPuck)); }
+
+function draw(g, dt) {
+  setView(g.seats.indexOf(net.sessionId));
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  ctx.fillStyle = "#070b1c"; ctx.fillRect(0, 0, W, H);
+  shake *= Math.exp(-dt * 8);
+  const k = DPR * scale, sx = (Math.random() - 0.5) * shake, sy = (Math.random() - 0.5) * shake;
+  const tableSpace = () => ctx.setTransform(k * M[0], k * M[2], k * M[1], k * M[3], DPR * (W / 2 + sx), DPR * (H / 2 + sy));
+  tableSpace(); // from here on: table units
+  const colorOf = (s) => (viewPaddles(g).find((q) => q.seat === s) || {}).color || "#888";
+  // rail and surface
+  ctx.fillStyle = "#1a2550"; rounded(-HW - 22, -HL - 22, CONFIG.tableW + 44, CONFIG.tableL + 44, 56); ctx.fill();
+  const grad = ctx.createLinearGradient(0, -HL, 0, HL); grad.addColorStop(0, "#10204f"); grad.addColorStop(0.5, "#162a63"); grad.addColorStop(1, "#10204f");
+  ctx.fillStyle = grad; rounded(-HW, -HL, CONFIG.tableW, CONFIG.tableL, 40); ctx.fill();
+  ctx.fillStyle = "#ffffff10"; // air holes
+  for (let x = -HW + 30; x < HW; x += 40) for (let y = -HL + 30; y < HL; y += 40) ctx.fillRect(x - 2, y - 2, 4, 4);
+  ctx.lineWidth = 6; ctx.strokeStyle = "#ff4d6d88"; ctx.beginPath(); ctx.moveTo(-HW, 0); ctx.lineTo(HW, 0); ctx.stroke();
+  ctx.beginPath(); ctx.arc(0, 0, 90, 0, Math.PI * 2); ctx.stroke();
+  for (const s of [0, 1]) { // each end's crease and goal mouth in that player's color
+    const y = s === 0 ? HL : -HL, c = colorOf(s);
+    ctx.strokeStyle = c + "99"; ctx.beginPath(); ctx.arc(0, y, 130, s === 0 ? Math.PI : 0, s === 0 ? Math.PI * 2 : Math.PI); ctx.stroke();
+    ctx.fillStyle = "#03050d"; ctx.fillRect(-GW, s === 0 ? HL - 4 : -HL - 22, GW * 2, 26);
+    ctx.fillStyle = c; ctx.fillRect(-GW - 8, s === 0 ? HL + 18 : -HL - 26, GW * 2 + 16, 8);
+  }
+  // each player's score, big and faint in their half, with their name under it (upright, in screen space)
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0); ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  for (const s of [0, 1]) {
+    const [x, y] = toScreen(0, s === 0 ? 250 : -250), q = viewPaddles(g).find((p) => p.seat === s);
+    ctx.font = `900 ${Math.round(190 * scale)}px system-ui, sans-serif`; ctx.fillStyle = colorOf(s) + "38"; ctx.fillText(g.score[s], x + sx, y + sy);
+    if (q && !ATTRACT) { ctx.font = "700 13px system-ui, sans-serif"; ctx.fillStyle = q.color + "cc"; ctx.fillText(q.name, x + sx, y + sy + 110 * scale); }
+  }
+  tableSpace();
+  // puck: trail, glow, body
+  const px = puck.x + pred.offX, py = puck.y + pred.offY;
+  pred.offX *= Math.exp(-dt * 14); pred.offY *= Math.exp(-dt * 14);
+  trail.push({ x: px, y: py }); if (trail.length > 12) trail.shift();
+  trail.forEach((t, i) => { ctx.fillStyle = `rgba(160,230,255,${(i / trail.length) * 0.18})`; ctx.beginPath(); ctx.arc(t.x, t.y, CONFIG.puckR * (0.5 + i / 24), 0, Math.PI * 2); ctx.fill(); });
+  glow(px, py, CONFIG.puckR * 2.4, "rgba(150,230,255,.35)");
+  ctx.fillStyle = "#0b0f1e"; ctx.beginPath(); ctx.arc(px, py, CONFIG.puckR, 0, Math.PI * 2); ctx.fill();
+  ctx.lineWidth = 5; ctx.strokeStyle = puck.z ? "#ffd166" : "#bdf1ff"; ctx.stroke();
+  // paddles
+  for (const q of viewPaddles(g)) {
+    glow(q.x, q.y, CONFIG.paddleR * 2, q.color + "55");
+    ctx.fillStyle = q.color; ctx.beginPath(); ctx.arc(q.x, q.y, CONFIG.paddleR, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = "#00000040"; ctx.beginPath(); ctx.arc(q.x, q.y, CONFIG.paddleR * 0.72, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = q.color; ctx.beginPath(); ctx.arc(q.x, q.y, CONFIG.paddleR * 0.42, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = "#ffffff70"; ctx.beginPath(); ctx.arc(q.x, q.y, CONFIG.paddleR * 0.16, 0, Math.PI * 2); ctx.fill();
+  }
+  for (let i = parts.length - 1; i >= 0; i--) {
+    const p = parts[i]; p.life -= dt; p.x += p.vx * dt; p.y += p.vy * dt; p.vx *= 0.92; p.vy *= 0.92;
+    if (p.life <= 0) { parts.splice(i, 1); continue; }
+    ctx.globalAlpha = Math.min(1, p.life * 2.5); ctx.fillStyle = p.color; ctx.fillRect(p.x - 4, p.y - 4, 8, 8);
+  }
+  ctx.globalAlpha = 1;
+}
+function rounded(x, y, w, h, r) { ctx.beginPath(); ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + h, r); ctx.arcTo(x + w, y + h, x, y + h, r); ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r); ctx.closePath(); }
+function glow(x, y, r, color) { const g = ctx.createRadialGradient(x, y, 0, x, y, r); g.addColorStop(0, color); g.addColorStop(1, "transparent"); ctx.fillStyle = g; ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.fill(); }
+
+// Sounds, made on the fly with WebAudio (no files).
+let audio = null;
+function unlockAudio() { if (!audio && !ATTRACT) try { audio = new AudioContext(); } catch {} }
+function sfx(kind, power = 1) {
+  if (!audio) return;
+  const t = audio.currentTime, o = audio.createOscillator(), gain = audio.createGain();
+  const [type, f0, f1, len, vol] = { hit: ["triangle", 500 + power * 500, 180, 0.08, 0.35], wall: ["sine", 220, 120, 0.07, 0.2 * power + 0.05], goal: ["sawtooth", 300, 900, 0.5, 0.18], lose: ["sawtooth", 300, 90, 0.5, 0.15] }[kind];
+  o.type = type; o.frequency.setValueAtTime(f0, t); o.frequency.exponentialRampToValueAtTime(f1, t + len);
+  gain.gain.setValueAtTime(vol, t); gain.gain.exponentialRampToValueAtTime(0.001, t + len);
+  o.connect(gain).connect(audio.destination); o.start(t); o.stop(t + len + 0.02);
+}
+
+// ── HUD & RESULTS ───────────────────────────────────────────────────────────────────
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+let board = null, boardFor = -1, lastScore = "", msgUntil = 0;
+const startedAt = performance.now();
+function nameOfSeat(g, s) { const id = g.seats[s]; return id === "bot" ? BOT_NAME : id === net.sessionId ? "You" : String((S.entities.players[id] || {}).n || "Player"); }
+function hud(g, now) {
+  const seat = g.seats.indexOf(net.sessionId), score = g.score.join("-");
+  if (lastScore && score !== lastScore && g.score[0] + g.score[1] > 0) { // a goal: show it from the state, so everyone sees it
+    const prev = lastScore.split("-").map(Number), scorer = g.score[0] > prev[0] ? 0 : 1, goalY = scorer === 0 ? -HL : HL;
+    sparks(0, goalY, (viewPaddles(g).find((q) => q.seat === scorer) || {}).color || "#fff", 40, 700); shake = 14;
+    $("msg").textContent = seat < 0 ? "GOAL!" : scorer === seat ? "GOAL!" : "Scored on!"; msgUntil = now + 1100;
+    sfx(seat < 0 || scorer === seat ? "goal" : "lose");
+  }
+  lastScore = score;
+  $("msg").classList.toggle("on", now < msgUntil);
+  if (ATTRACT) { $("role").textContent = $("hint").textContent = $("net").textContent = ""; return; }
+  const me = seat >= 0 ? seat : 0;
+  $("role").textContent = seat >= 0 ? `You ${g.score[seat]} – ${g.score[1 - seat]} ${nameOfSeat(g, 1 - seat)} · first to ${CONFIG.goalsToWin}` : `Watching ${nameOfSeat(g, 0)} ${g.score[0]} – ${g.score[1]} ${nameOfSeat(g, 1)} · you play the winner`;
+  $("hint").textContent = seat >= 0 ? (touchUI ? "Drag your paddle. Hit the puck into the far goal." : "Move your paddle with the mouse. Hit the puck into the far goal.") : "";
+  $("hint").style.opacity = now - startedAt < 7000 ? 1 : 0;
+  const n = livePlayers().length;
+  $("net").textContent = net.offline ? "Offline: playing a bot" : `Online · ${n} player${n === 1 ? "" : "s"}${isHost() ? " · you run the puck" : ""}`;
+  $("over").hidden = g.phase !== "over";
+  if (g.phase === "over") {
+    const won = seat >= 0 && g.win === seat;
+    $("winner").textContent = won ? "You win!" : seat >= 0 ? `${nameOfSeat(g, g.win)} wins` : `${nameOfSeat(g, g.win)} wins!`;
+    $("final").textContent = `${g.score[Math.max(0, g.win)]} – ${g.score[1 - Math.max(0, g.win)]}`;
+    $("again").hidden = seat < 0;
+    $("again").textContent = myReady === g.id ? "Waiting for the other player…" : "Play again";
+    $("next").textContent = `Next match in ${Math.max(0, Math.ceil((g.endsAt - Date.now()) / 1000))}s`;
+    if (boardFor !== g.id) { boardFor = g.id; showBoard(won); }
+  }
+}
+function showBoard(won) {
+  const list = $("board");
+  if (!board) { list.innerHTML = "<li>Leaderboards need a connection.</li>"; return; }
+  list.innerHTML = "<li>Loading…</li>";
+  (won ? board.submit(1, "inc").catch(() => null) : Promise.resolve()).then(() => board.top(10)).then(({ entries }) => {
+    list.innerHTML = entries.length ? entries.map((e) => `<li>${esc(e.username || "Player")}<span>${e.score}</span></li>`).join("") : "<li>No wins yet. Be the first.</li>";
+  }).catch(() => { list.innerHTML = "<li>Couldn't load the leaderboard.</li>"; });
+}
+$("again").onclick = () => { const g = game(); if (g && g.phase === "over") { myReady = g.id; net.me.set("rdy", g.id); } };
+
+/** Two players picked the same color at once (the joiner's first state can be empty): the later sessionId picks again. */
+function fixColor() {
+  const others = Object.entries(S.entities.players || {}).filter(([id]) => id !== net.sessionId);
+  if (!others.some(([id, p]) => p.c === myColor && id < net.sessionId)) return;
+  const taken = new Set(others.map(([, p]) => p.c));
+  myColor = COLORS.find((c) => !taken.has(c)) || myColor; net.me.set("c", myColor);
+}
+
+// ── INPUT ───────────────────────────────────────────────────────────────────────────
+const touchUI = matchMedia("(pointer: coarse)").matches;
+function aim(e) {
+  const [x, y] = toTable(e.clientX, e.clientY - (e.pointerType === "touch" ? 36 : 0)); // on touch the paddle sits just above your finger
+  pad.tx = x; pad.ty = y;
+}
+cv.addEventListener("pointermove", (e) => { if (e.pointerType !== "touch" || e.buttons) aim(e); });
+cv.addEventListener("pointerdown", (e) => { e.preventDefault(); unlockAudio(); aim(e); });
+document.addEventListener("touchmove", (e) => e.preventDefault(), { passive: false });
+
+// ── MAIN LOOP ───────────────────────────────────────────────────────────────────────
+let last = performance.now(), lastHb = 0, lastHud = 0;
+function frame(now) {
+  const dt = Math.min(0.05, (now - last) / 1000); last = now;
+  if (now - lastHb > 1000) { lastHb = now; net.me.set("hb", Date.now()); fixColor(); }
+  if (isHost()) hostTick(dt, now); else host.wasHost = false;
+  const g = game();
+  if (g) {
+    myTick(dt, g, now);
+    for (const [id, p] of Object.entries(S.entities.players || {})) { // other players' paddles, eased toward their last write
+      if (id === net.sessionId) continue;
+      const q = cached("pad:" + id, p.pad, null); if (!q) continue;
+      const v = views.get(id) || views.set(id, { x: q.x, y: q.y }).get(id), k = 1 - Math.exp(-dt * 22);
+      v.x += (q.x - v.x) * k; v.y += (q.y - v.y) * k;
+    }
+    draw(g, dt);
+    if (now - lastHud > 100) { lastHud = now; hud(g, now); }
+  }
+  requestAnimationFrame(frame);
+}
+
+(async function start() {
+  net = await connect();
+  net.onState((st) => { S = st; });
+  net.on("hit", (msg, from) => { if (isHost() && msg) applyHit(msg, from); });
+  net.onDisconnect(() => { $("net").textContent = "Reconnecting…"; });
+  if (!net.offline && typeof MP !== "undefined") board = MP.auth({ key: MP_CONNECT.key, apiUrl: MP_CONNECT.apiUrl }).leaderboard(CONFIG.board);
+  const taken = new Set(Object.entries(S.entities.players || {}).filter(([id]) => id !== net.sessionId).map(([, p]) => p.c));
+  myColor = COLORS.find((c) => !taken.has(c)) || COLORS[Math.floor(Math.random() * COLORS.length)];
+  net.me.set({ n: myName, c: myColor, hb: Date.now() });
+  if (ATTRACT) { $("net").textContent = ""; Object.assign(CONFIG, { servePause: 600, botError: 60, botSpeed: 1400, botDefend: 0.1, goalsToWin: 99 }); }
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

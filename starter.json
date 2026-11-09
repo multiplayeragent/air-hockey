@@ -1,0 +1,21 @@
+{
+  "name": "Air Hockey",
+  "genre": "sports",
+  "dim": "2D",
+  "mode": "Versus",
+  "players": "2",
+  "hook": "One puck, real bounces, first to 7.",
+  "how": "Move your paddle with the mouse or a finger and smack the puck into the other goal. Each of you sees the table from your own end. Alone, you play a bot; a third person watches and plays the winner.",
+  "controls": "Mouse or touch",
+  "uses": [
+    ["Host-run rules", "One player's browser moves the puck and keeps the score, so both players see the same bounce; if it leaves, the other player takes over."],
+    ["Leaderboard", "Most wins, for every player."],
+    ["Bots", "A bot plays the other paddle until a friend joins."],
+    ["Live sync", "Both paddles and the puck move for everyone at once."]
+  ],
+  "ideas": [
+    "Add a second puck after each goal",
+    "Make it four players, one on each side",
+    "Add a power-up that shrinks the other goal"
+  ]
+}
