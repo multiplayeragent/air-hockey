@@ -272,7 +272,10 @@ function botMove(b, seat, dt, now, g) {
     const ax = b.aimX + b.err - puck.x, ay = -dir * HL - puck.y, al = Math.hypot(ax, ay);
     if (behind) { tx = puck.x + (ax / al) * 40; ty = puck.y + (ay / al) * 40; } // drive through it toward the aim point
     else { tx = puck.x + (b.x > puck.x ? 1 : -1) * 80; ty = puck.y + dir * 90; } // go round to get behind it
-  }
+    // a slow puck it can't get behind (against its own end wall) would sit there forever: just hit it
+    if (Math.hypot(puck.vx, puck.vy) < 60) { b.slowSince = b.slowSince || now; if (now - b.slowSince > 1500) { tx = puck.x; ty = puck.y; } }
+    else b.slowSince = 0;
+  } else b.slowSince = 0;
   movePaddle(b, tx, ty, CONFIG.botSpeed, seat, dt);
 }
 
