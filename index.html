@@ -16,7 +16,7 @@
   #msg.on { opacity: 1; transform: translateY(-50%) scale(1.08); }
   #net { bottom: max(10px, env(safe-area-inset-bottom)); font-size: 12px; opacity: .75; }
   #over { position: fixed; inset: 0; display: grid; place-items: center; background: #070b1cb0; }
-  .card { width: min(340px, 88vw); max-height: 86vh; overflow: auto; padding: 22px; border-radius: 16px; background: #121a3a; border: 1px solid #ffffff22; text-align: center; }
+  .card { box-sizing: border-box; width: min(386px, calc(100vw - 32px)); max-height: 86vh; overflow: auto; padding: 22px; border-radius: 16px; background: #121a3a; border: 1px solid #ffffff22; text-align: center; }
   .card h2 { margin: 0 0 4px; font-size: 26px; }
   .card h3 { margin: 14px 0 4px; font-size: 14px; color: #ffd166; text-align: left; }
   .card ol { text-align: left; margin: 0; padding-left: 26px; font-size: 14px; min-height: 30px; }
@@ -209,7 +209,9 @@ function writePuck(onlyIfMoved) {
 function adopt() {
   host.wasHost = true; host.pending = null;
   const p = parse(S.shared.puck, null);
-  if (p) { Object.assign(puck, p); host.bots = (p.b || [0, 0]).map((q) => (q ? { x: q[0], y: q[1], vx: 0, vy: 0, err: 0, thinkAt: 0 } : null)); }
+  // Our own prediction of the puck is newer than the last write (the old host may have frozen seconds ago): keep it.
+  // A puck our prediction put in a goal is nudged past the line, so that goal counts.
+  if (p) { if (pred.lastS === p.s) Object.assign(puck, { h: Math.max(puck.h, p.h), s: p.s, y: Math.abs(puck.y) >= HL + CONFIG.puckR ? puck.y * 1.01 : puck.y }); else Object.assign(puck, p); host.bots = (p.b || [0, 0]).map((q) => (q ? { x: q[0], y: q[1], vx: 0, vy: 0, err: 0, thinkAt: 0 } : null)); }
   host.gameId = game()?.id ?? 0;
 }
 /** Seats: someone who left is replaced by a bot (the match goes on); a waiting player replaces a bot (a new match). */
@@ -431,6 +433,7 @@ const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&l
 let board = null, boardFor = -1, lastScore = "", msgUntil = 0;
 const startedAt = performance.now();
 function nameOfSeat(g, s) { const id = g.seats[s]; return id === "bot" ? BOT_NAME : id === net.sessionId ? "You" : String((S.entities.players[id] || {}).n || "Player"); }
+let dropped = false; // true while the connection is down: the HUD keeps showing "Reconnecting…"
 function hud(g, now) {
   const seat = g.seats.indexOf(net.sessionId), score = g.score.join("-");
   if (lastScore && score !== lastScore && g.score[0] + g.score[1] > 0) { // a goal: show it from the state, so everyone sees it
@@ -447,7 +450,7 @@ function hud(g, now) {
   $("hint").textContent = seat >= 0 ? (touchUI ? "Drag your paddle. Hit the puck into the far goal." : "Move your paddle with the mouse. Hit the puck into the far goal.") : "";
   $("hint").style.opacity = now - startedAt < 7000 ? 1 : 0;
   const n = livePlayers().length;
-  $("net").textContent = net.offline ? "Offline: playing a bot" : `Online · ${n} player${n === 1 ? "" : "s"}${isHost() ? " · you run the puck" : ""}`;
+  $("net").textContent = net.offline ? "Offline: playing a bot" : dropped ? "Reconnecting…" : `Online · ${n} player${n === 1 ? "" : "s"}${isHost() ? " · you run the puck" : ""}`;
   $("over").hidden = g.phase !== "over";
   if (g.phase === "over") {
     const won = seat >= 0 && g.win === seat;
@@ -490,7 +493,7 @@ document.addEventListener("touchmove", (e) => e.preventDefault(), { passive: fal
 // ── MAIN LOOP ───────────────────────────────────────────────────────────────────────
 let last = performance.now(), lastHb = 0, lastHud = 0;
 function frame(now) {
-  const dt = Math.min(0.05, (now - last) / 1000); last = now;
+  const dt = Math.max(0, Math.min(0.05, (now - last) / 1000)); last = now; // never negative: the first frame can be stamped before `last`
   if (now - lastHb > 1000) { lastHb = now; net.me.set("hb", Date.now()); fixColor(); }
   if (isHost()) hostTick(dt, now); else host.wasHost = false;
   const g = game();
@@ -512,7 +515,8 @@ function frame(now) {
   net = await connect();
   net.onState((st) => { S = st; });
   net.on("hit", (msg, from) => { if (isHost() && msg) applyHit(msg, from); });
-  net.onDisconnect(() => { $("net").textContent = "Reconnecting…"; });
+  net.onDisconnect(() => { dropped = true; $("net").textContent = "Reconnecting…"; });
+  net.onReconnect(() => { dropped = false; });
   if (!net.offline && typeof MP !== "undefined") board = MP.auth({ key: MP_CONNECT.key, apiUrl: MP_CONNECT.apiUrl }).leaderboard(CONFIG.board);
   const taken = new Set(Object.entries(S.entities.players || {}).filter(([id]) => id !== net.sessionId).map(([, p]) => p.c));
   myColor = COLORS.find((c) => !taken.has(c)) || COLORS[Math.floor(Math.random() * COLORS.length)];
