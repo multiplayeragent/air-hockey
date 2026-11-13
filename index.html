@@ -167,7 +167,7 @@ function stepPuck(p, dt, paddles) {
     if (Math.abs(p.x) > HW - r) { p.x = Math.sign(p.x) * (HW - r); p.vx = -p.vx * CONFIG.bounce; out.wall = true; }
     const inMouth = Math.abs(p.x) < GW - r * 0.5;
     if (!inMouth && Math.abs(p.y) > HL - r) { p.y = Math.sign(p.y) * (HL - r); p.vy = -p.vy * CONFIG.bounce; out.wall = true; }
-    if (Math.abs(p.y) > HL + r) { p.y = Math.sign(p.y) * (HL + r); p.vx = p.vy = 0; out.goal = p.y > 0 ? 0 : 1; break; }
+    if (Math.abs(p.y) >= HL + r) { p.y = Math.sign(p.y) * (HL + r); p.vx = p.vy = 0; out.goal = p.y > 0 ? 0 : 1; break; } // >=: a puck left sitting on the line (a new host adopting it) still counts
   }
   const sp = Math.hypot(p.vx, p.vy), k = sp > CONFIG.maxPuck ? CONFIG.maxPuck / sp : 1, f = Math.max(0, 1 - CONFIG.friction * dt) * k;
   p.vx *= f; p.vy *= f;
@@ -492,6 +492,7 @@ function aim(e) {
 }
 cv.addEventListener("pointermove", (e) => { if (e.pointerType !== "touch" || e.buttons) aim(e); });
 cv.addEventListener("pointerdown", (e) => { e.preventDefault(); unlockAudio(); aim(e); });
+cv.addEventListener("contextmenu", (e) => e.preventDefault());
 document.addEventListener("touchmove", (e) => e.preventDefault(), { passive: false });
 
 // ── MAIN LOOP ───────────────────────────────────────────────────────────────────────
